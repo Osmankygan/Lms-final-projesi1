@@ -1,10 +1,26 @@
 import streamlit as st
-import requests
 import os
 from dotenv import load_dotenv
 
+# Database and Models
+from database import SessionLocal, init_db, hash_password, verify_password
+import models
+import ai_service
+
 # Load env variables if they exist
 load_dotenv()
+
+# Initialize DB on first run in Streamlit
+@st.cache_resource
+def setup_database():
+    init_db()
+    return True
+
+setup_database()
+
+# DB Helper
+def get_session():
+    return SessionLocal()
 
 # Page configuration
 st.set_page_config(
@@ -13,9 +29,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# API Base URL
-API_URL = "http://127.0.0.1:8000"
 
 # Custom CSS for Premium Look
 st.markdown("""
@@ -146,7 +159,7 @@ with st.sidebar:
             f"{provider} API Key", 
             type="password", 
             value=st.session_state.api_key, 
-            placeholder="Anahtar girilmezse Mock AI kullanılır"
+            placeholder="Anahtar girilmezse .env veya Mock AI kullanılır"
         )
         st.session_state.api_key = custom_key
         
@@ -158,46 +171,6 @@ with st.sidebar:
             
     else:
         st.info("Devam etmek için giriş yapın veya yeni bir hesap oluşturun.")
-
-# Check Backend Connection Helper
-def check_backend():
-    try:
-        # Just simple test to API URL
-        requests.get(f"{API_URL}/courses/all", timeout=2)
-        return True
-    except Exception:
-        return False
-
-# Main Render Flow
-if not check_backend():
-    st.error("⚠️ Backend API (FastAPI) sunucusuna bağlanılamadı.")
-    st.warning("Lütfen komut satırından FastAPI sunucusunun çalıştığından emin olun:\n`uvicorn main:app --reload --port 8000`")
-    st.info("Bu sırada verileri yükleyemez veya işlem yapamazsınız.")
-    if st.button("Yeniden Bağlanmayı Dene"):
-        st.rerun()
-    st.stop()
-
-# Helper API functions
-def login_user(username, password):
-    try:
-        res = requests.post(f"{API_URL}/login", json={"username": username, "password": password})
-        if res.status_code == 200:
-            return res.json(), None
-        else:
-            return None, res.json().get("detail", "Giriş başarısız.")
-    except Exception as e:
-        return None, f"Hata: {str(e)}"
-
-def register_user(username, password, role):
-    try:
-        res = requests.post(f"{API_URL}/register", json={"username": username, "password": password, "role": role})
-        if res.status_code == 201:
-            return res.json(), None
-        else:
-            return None, res.json().get("detail", "Kayıt başarısız.")
-    except Exception as e:
-        return None, f"Hata: {str(e)}"
-
 
 # ==========================================
 # AUTHENTICATION PAGE
@@ -218,14 +191,22 @@ if not st.session_state.logged_in:
                 if not l_username or not l_password:
                     st.error("Lütfen tüm alanları doldurun.")
                 else:
-                    user, err = login_user(l_username, l_password)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.session_state.logged_in = True
-                        st.session_state.user = user
-                        st.success("Giriş başarılı!")
-                        st.rerun()
+                    db = get_session()
+                    try:
+                        db_user = db.query(models.User).filter(models.User.username == l_username).first()
+                        if not db_user or not verify_password(l_password, db_user.password_hash):
+                            st.error("Geçersiz kullanıcı adı veya şifre.")
+                        else:
+                            st.session_state.logged_in = True
+                            st.session_state.user = {
+                                "id": db_user.id,
+                                "username": db_user.username,
+                                "role": db_user.role
+                            }
+                            st.success("Giriş başarılı!")
+                            st.rerun()
+                    finally:
+                        db.close()
                         
     with col2:
         st.subheader("Kayıt Ol")
@@ -239,11 +220,19 @@ if not st.session_state.logged_in:
                 if not r_username or not r_password:
                     st.error("Lütfen tüm alanları doldurun.")
                 else:
-                    user, err = register_user(r_username, r_password, r_role)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success("Kayıt başarılı! Giriş yapabilirsiniz.")
+                    db = get_session()
+                    try:
+                        existing = db.query(models.User).filter(models.User.username == r_username).first()
+                        if existing:
+                            st.error("Bu kullanıcı adı zaten alınmış.")
+                        else:
+                            hashed_pwd = hash_password(r_password)
+                            new_user = models.User(username=r_username, password_hash=hashed_pwd, role=r_role)
+                            db.add(new_user)
+                            db.commit()
+                            st.success("Kayıt başarılı! Giriş yapabilirsiniz.")
+                    finally:
+                        db.close()
 
 # ==========================================
 # STUDENT DASHBOARD
@@ -257,134 +246,143 @@ elif st.session_state.user["role"] == "student":
     
     # 1. MY COURSES TAB
     with tab_my_courses:
-        res = requests.get(f"{API_URL}/courses?student_id={student_id}")
-        my_courses = res.json() if res.status_code == 200 else []
-        
-        if not my_courses:
-            st.info("Henüz hiçbir kursa kayıtlı değilsiniz. 'Tüm Kursları Keşfet' sekmesinden kaydolabilirsiniz.")
-        else:
-            # Dropdown to select active course
-            course_options = {c["title"]: c for c in my_courses}
-            selected_course_title = st.selectbox("Detayları görüntülemek için bir ders seçin:", list(course_options.keys()))
-            selected_course = course_options[selected_course_title]
+        db = get_session()
+        try:
+            my_courses_db = db.query(models.Course).join(models.Enrollment).filter(models.Enrollment.student_id == student_id).all()
+            my_courses = [{"id": c.id, "title": c.title, "description": c.description} for c in my_courses_db]
             
-            st.divider()
-            st.subheader(selected_course["title"])
-            st.write(selected_course["description"])
-            
-            subtab_materials, subtab_assignments = st.tabs(["📖 Ders Materyalleri", "📝 Ödev Gönderimi"])
-            
-            # Subtab: Materials
-            with subtab_materials:
-                mat_res = requests.get(f"{API_URL}/courses/{selected_course['id']}/materials")
-                materials = mat_res.json() if mat_res.status_code == 200 else []
+            if not my_courses:
+                st.info("Henüz hiçbir kursa kayıtlı değilsiniz. 'Tüm Kursları Keşfet' sekmesinden kaydolabilirsiniz.")
+            else:
+                course_options = {c["title"]: c for c in my_courses}
+                selected_course_title = st.selectbox("Detayları görüntülemek için bir ders seçin:", list(course_options.keys()))
+                selected_course = course_options[selected_course_title]
                 
-                if not materials:
-                    st.info("Bu ders için henüz materyal yüklenmemiş.")
-                else:
-                    for mat in materials:
-                        with st.expander(f"📄 {mat['title']}"):
-                            st.write(mat['content'])
-                            
-                            st.markdown("---")
-                            # Summarization Trigger
-                            if st.button("🤖 Yapay Zekâ ile Özetle", key=f"sum_{mat['id']}"):
-                                with st.spinner("Özet hazırlanıyor..."):
-                                    sum_res = requests.post(
-                                        f"{API_URL}/ai/summarize",
-                                        json={
-                                            "content": mat['content'],
-                                            "provider": st.session_state.api_provider,
-                                            "api_key": st.session_state.api_key
-                                        }
-                                    )
-                                    if sum_res.status_code == 200:
-                                        st.info("### Yapay Zekâ Özeti")
-                                        st.markdown(sum_res.json()["summary"])
-                                    else:
-                                        st.error("Özet oluşturulamadı.")
-                                        
-            # Subtab: Assignments & AI feedback
-            with subtab_assignments:
-                st.subheader("Ödev Teslim Et")
-                st.write("Aşağıdaki alana ödevinizi veya makalenizi yazarak teslim edin. Yapay zekâ anında değerlendirme sunacaktır.")
-                
-                with st.form("submission_form"):
-                    essay_text = st.text_area("Ödev İçeriği", height=250, placeholder="Konuyla ilgili analiz veya makalenizi buraya yazın...")
-                    submit_essay = st.form_submit_button("Yapay Zekâ Analizi ile Ödevi Teslim Et")
-                    
-                    if submit_essay:
-                        if not essay_text.strip():
-                            st.error("Ödev metni boş bırakılamaz.")
-                        else:
-                            with st.spinner("Ödeviniz yapay zekâ tarafından analiz ediliyor..."):
-                                sub_res = requests.post(
-                                    f"{API_URL}/courses/{selected_course['id']}/submissions?student_id={student_id}&provider={st.session_state.api_provider}&api_key={st.session_state.api_key}",
-                                    json={"text_content": essay_text}
-                                )
-                                if sub_res.status_code == 201:
-                                    st.success("Ödeviniz başarıyla teslim edildi ve analiz edildi!")
-                                    data = sub_res.json()
-                                    st.session_state.last_submission = data
-                                else:
-                                    st.error("Ödev gönderilemedi veya yapay zekâ hatası oluştu.")
-                                    
-                # Show last feedback if available
-                if "last_submission" in st.session_state:
-                    sub = st.session_state.last_submission
-                    st.markdown("### Son Ödev Değerlendirme Raporu")
-                    col_grade, col_fb = st.columns([1, 4])
-                    with col_grade:
-                        st.markdown("**AI Öneri Notu**")
-                        st.markdown(f'<div class="grade-badge">{sub["grade"]}</div>', unsafe_allow_html=True)
-                    with col_fb:
-                        st.markdown(sub["ai_feedback"])
-                        
                 st.divider()
-                st.subheader("Geçmiş Gönderilerim")
-                hist_res = requests.get(f"{API_URL}/courses/{selected_course['id']}/submissions?student_id={student_id}")
-                submissions = hist_res.json() if hist_res.status_code == 200 else []
+                st.subheader(selected_course["title"])
+                st.write(selected_course["description"])
                 
-                if not submissions:
-                    st.info("Bu ders için geçmiş bir ödev gönderiniz bulunmamaktadır.")
-                else:
-                    for i, sub in enumerate(reversed(submissions)):
-                        date_str = sub["submitted_at"].split("T")[0]
-                        with st.expander(f"📅 Teslim Tarihi: {date_str} - Not: {sub['grade']}"):
-                            st.text_area("Gönderilen Metin", sub["text_content"], height=100, disabled=True, key=f"hist_txt_{i}")
-                            st.markdown("#### AI Değerlendirmesi ve Geribildirim")
+                subtab_materials, subtab_assignments = st.tabs(["📖 Ders Materyalleri", "📝 Ödev Gönderimi"])
+                
+                # Subtab: Materials
+                with subtab_materials:
+                    materials_db = db.query(models.Material).filter(models.Material.course_id == selected_course["id"]).all()
+                    materials = [{"id": m.id, "title": m.title, "content": m.content} for m in materials_db]
+                    
+                    if not materials:
+                        st.info("Bu ders için henüz materyal yüklenmemiş.")
+                    else:
+                        for mat in materials:
+                            with st.expander(f"📄 {mat['title']}"):
+                                st.write(mat['content'])
+                                
+                                st.markdown("---")
+                                if st.button("🤖 Yapay Zekâ ile Özetle", key=f"sum_{mat['id']}"):
+                                    with st.spinner("Özet hazırlanıyor..."):
+                                        summary = ai_service.summarize_text(
+                                            text=mat['content'],
+                                            provider=st.session_state.api_provider,
+                                            api_key=st.session_state.api_key
+                                        )
+                                        st.info("### Yapay Zekâ Özeti")
+                                        st.markdown(summary)
+                                            
+                # Subtab: Assignments & AI feedback
+                with subtab_assignments:
+                    st.subheader("Ödev Teslim Et")
+                    st.write("Aşağıdaki alana ödevinizi veya makalenizi yazarak teslim edin. Yapay zekâ anında değerlendirme sunacaktır.")
+                    
+                    with st.form("submission_form"):
+                        essay_text = st.text_area("Ödev İçeriği", height=250, placeholder="Konuyla ilgili analiz veya makalenizi buraya yazın...")
+                        submit_essay = st.form_submit_button("Yapay Zekâ Analizi ile Ödevi Teslim Et")
+                        
+                        if submit_essay:
+                            if not essay_text.strip():
+                                st.error("Ödev metni boş bırakılamaz.")
+                            else:
+                                with st.spinner("Ödeviniz yapay zekâ tarafından analiz ediliyor..."):
+                                    analysis = ai_service.analyze_submission(
+                                        text_content=essay_text,
+                                        course_title=selected_course["title"],
+                                        provider=st.session_state.api_provider,
+                                        api_key=st.session_state.api_key
+                                    )
+                                    
+                                    new_sub = models.Submission(
+                                        student_id=student_id,
+                                        course_id=selected_course["id"],
+                                        text_content=essay_text,
+                                        ai_feedback=analysis.get("feedback"),
+                                        grade=analysis.get("grade")
+                                    )
+                                    db.add(new_sub)
+                                    db.commit()
+                                    db.refresh(new_sub)
+                                    
+                                    st.success("Ödeviniz başarıyla teslim edildi ve analiz edildi!")
+                                    st.session_state.last_submission = {
+                                        "grade": new_sub.grade,
+                                        "ai_feedback": new_sub.ai_feedback
+                                    }
+                                        
+                    if "last_submission" in st.session_state:
+                        sub = st.session_state.last_submission
+                        st.markdown("### Son Ödev Değerlendirme Raporu")
+                        col_grade, col_fb = st.columns([1, 4])
+                        with col_grade:
+                            st.markdown("**AI Öneri Notu**")
+                            st.markdown(f'<div class="grade-badge">{sub["grade"]}</div>', unsafe_allow_html=True)
+                        with col_fb:
                             st.markdown(sub["ai_feedback"])
+                            
+                    st.divider()
+                    st.subheader("Geçmiş Gönderilerim")
+                    submissions_db = db.query(models.Submission).filter(
+                        models.Submission.course_id == selected_course["id"],
+                        models.Submission.student_id == student_id
+                    ).order_by(models.Submission.submitted_at.desc()).all()
+                    
+                    if not submissions_db:
+                        st.info("Bu ders için geçmiş bir ödev gönderiniz bulunmamaktadır.")
+                    else:
+                        for i, sub in enumerate(submissions_db):
+                            date_str = str(sub.submitted_at).split(" ")[0]
+                            with st.expander(f"📅 Teslim Tarihi: {date_str} - Not: {sub.grade}"):
+                                st.text_area("Gönderilen Metin", sub.text_content, height=100, disabled=True, key=f"hist_txt_{i}")
+                                st.markdown("#### AI Değerlendirmesi ve Geribildirim")
+                                st.markdown(sub.ai_feedback)
+        finally:
+            db.close()
 
     # 2. ALL COURSES TAB
     with tab_all_courses:
-        all_res = requests.get(f"{API_URL}/courses/all")
-        all_courses = all_res.json() if all_res.status_code == 200 else []
-        
-        # Get list of enrolled course IDs
-        my_course_ids = [c["id"] for c in my_courses]
-        
-        if not all_courses:
-            st.info("Sistemde henüz kurs bulunmamaktadır.")
-        else:
-            for course in all_courses:
-                st.markdown(f"""
-                <div class="course-card">
-                    <h3>{course['title']}</h3>
-                    <p>{course['description'] or 'Açıklama bulunmuyor.'}</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Enroll button logic
-                if course["id"] in my_course_ids:
-                    st.button("Zaten Kayıtlısınız", key=f"enroll_btn_{course['id']}", disabled=True)
-                else:
-                    if st.button("Kursa Kaydol", key=f"enroll_btn_{course['id']}"):
-                        enroll_res = requests.post(f"{API_URL}/courses/{course['id']}/enroll?student_id={student_id}")
-                        if enroll_res.status_code == 201:
-                            st.success(f"'{course['title']}' kursuna başarıyla kaydoldunuz!")
+        db = get_session()
+        try:
+            all_courses_db = db.query(models.Course).all()
+            my_course_ids = [c.id for c in db.query(models.Enrollment).filter(models.Enrollment.student_id == student_id).all()]
+            
+            if not all_courses_db:
+                st.info("Sistemde henüz kurs bulunmamaktadır.")
+            else:
+                for course in all_courses_db:
+                    st.markdown(f"""
+                    <div class="course-card">
+                        <h3>{course.title}</h3>
+                        <p>{course.description or 'Açıklama bulunmuyor.'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if course.id in my_course_ids:
+                        st.button("Zaten Kayıtlısınız", key=f"enroll_btn_{course.id}", disabled=True)
+                    else:
+                        if st.button("Kursa Kaydol", key=f"enroll_btn_{course.id}"):
+                            new_enrollment = models.Enrollment(student_id=student_id, course_id=course.id)
+                            db.add(new_enrollment)
+                            db.commit()
+                            st.success(f"'{course.title}' kursuna başarıyla kaydoldunuz!")
                             st.rerun()
-                        else:
-                            st.error("Kayıt sırasında hata oluştu.")
+        finally:
+            db.close()
 
 
 # ==========================================
@@ -399,98 +397,89 @@ elif st.session_state.user["role"] == "teacher":
     
     # 1. TEACHER'S COURSES MANAGEMENT
     with tab_my_courses:
-        t_res = requests.get(f"{API_URL}/courses?teacher_id={teacher_id}")
-        teacher_courses = t_res.json() if t_res.status_code == 200 else []
-        
-        if not teacher_courses:
-            st.info("Henüz oluşturduğunuz bir ders yok. 'Yeni Ders Oluştur' sekmesini kullanabilirsiniz.")
-        else:
-            course_options = {c["title"]: c for c in teacher_courses}
-            selected_course_title = st.selectbox("Yönetmek istediğiniz dersi seçin:", list(course_options.keys()))
-            selected_course = course_options[selected_course_title]
+        db = get_session()
+        try:
+            teacher_courses_db = db.query(models.Course).filter(models.Course.teacher_id == teacher_id).all()
+            teacher_courses = [{"id": c.id, "title": c.title, "description": c.description} for c in teacher_courses_db]
             
-            st.divider()
-            st.subheader(f"Ders: {selected_course['title']}")
-            st.write(selected_course["description"])
-            
-            subtab_add_material, subtab_evaluate_submissions = st.tabs(["📄 Materyal Ekle", "📝 Öğrenci Ödev Değerlendirmeleri"])
-            
-            # Subtab: Add Material
-            with subtab_add_material:
-                st.subheader("Yeni Materyal Ekle")
-                with st.form("add_material_form"):
-                    m_title = st.text_input("Materyal Başlığı", placeholder="Örn: Hafta 1 - Giriş Ders Notları")
-                    m_content = st.text_area("Materyal Metni", height=200, placeholder="Öğrencilerin okuyacağı ve yapay zekânın özetleyebileceği ders içeriğini buraya girin...")
-                    submit_material = st.form_submit_button("Materyali Yayınla")
-                    
-                    if submit_material:
-                        if not m_title or not m_content:
-                            st.error("Başlık ve içerik boş olamaz.")
-                        else:
-                            mat_post_res = requests.post(
-                                f"{API_URL}/courses/{selected_course['id']}/materials?teacher_id={teacher_id}",
-                                json={"title": m_title, "content": m_content}
-                            )
-                            if mat_post_res.status_code == 201:
-                                st.success("Ders materyali başarıyla yayınlandı!")
+            if not teacher_courses:
+                st.info("Henüz oluşturduğunuz bir ders yok. 'Yeni Ders Oluştur' sekmesini kullanabilirsiniz.")
+            else:
+                course_options = {c["title"]: c for c in teacher_courses}
+                selected_course_title = st.selectbox("Yönetmek istediğiniz dersi seçin:", list(course_options.keys()))
+                selected_course = course_options[selected_course_title]
+                
+                st.divider()
+                st.subheader(f"Ders: {selected_course['title']}")
+                st.write(selected_course["description"])
+                
+                subtab_add_material, subtab_evaluate_submissions = st.tabs(["📄 Materyal Ekle", "📝 Öğrenci Ödev Değerlendirmeleri"])
+                
+                # Subtab: Add Material
+                with subtab_add_material:
+                    st.subheader("Yeni Materyal Ekle")
+                    with st.form("add_material_form"):
+                        m_title = st.text_input("Materyal Başlığı", placeholder="Örn: Hafta 1 - Giriş Ders Notları")
+                        m_content = st.text_area("Materyal Metni", height=200, placeholder="Öğrencilerin okuyacağı ve yapay zekânın özetleyebileceği ders içeriğini buraya girin...")
+                        submit_material = st.form_submit_button("Materyali Yayınla")
+                        
+                        if submit_material:
+                            if not m_title or not m_content:
+                                st.error("Başlık ve içerik boş olamaz.")
                             else:
-                                st.error("Materyal eklenirken hata oluştu.")
+                                new_mat = models.Material(course_id=selected_course["id"], title=m_title, content=m_content)
+                                db.add(new_mat)
+                                db.commit()
+                                st.success("Ders materyali başarıyla yayınlandı!")
+                                    
+                    st.subheader("Mevcut Materyaller")
+                    existing_mats = db.query(models.Material).filter(models.Material.course_id == selected_course["id"]).all()
+                    if not existing_mats:
+                        st.info("Bu derse henüz materyal eklenmemiş.")
+                    else:
+                        for emat in existing_mats:
+                            date_str = str(emat.created_at).split(" ")[0]
+                            st.text(f"• {emat.title} ({date_str})")
+                
+                # Subtab: Evaluate Student Submissions
+                with subtab_evaluate_submissions:
+                    st.subheader("Ödev Değerlendirme & AI Analizleri")
+                    
+                    submissions_db = db.query(models.Submission).filter(models.Submission.course_id == selected_course["id"]).all()
+                    
+                    if not submissions_db:
+                        st.info("Bu derse henüz ödev gönderimi yapılmamış.")
+                    else:
+                        for i, sub in enumerate(submissions_db):
+                            student_db = db.query(models.User).filter(models.User.id == sub.student_id).first()
+                            student_name = student_db.username if student_db else f"Öğrenci #{sub.student_id}"
+                            submitted_date = str(sub.submitted_at).split(" ")[0]
+                            
+                            with st.expander(f"👤 Öğrenci: {student_name} | Tarih: {submitted_date} | Not: {sub.grade}"):
+                                st.markdown("**Öğrencinin Gönderdiği Metin:**")
+                                st.text_area("İçerik", sub.text_content, height=150, disabled=True, key=f"t_sub_txt_{i}")
                                 
-                # List existing materials for reference
-                st.subheader("Mevcut Materyaller")
-                mat_list_res = requests.get(f"{API_URL}/courses/{selected_course['id']}/materials")
-                existing_mats = mat_list_res.json() if mat_list_res.status_code == 200 else []
-                if not existing_mats:
-                    st.info("Bu derse henüz materyal eklenmemiş.")
-                else:
-                    for emat in existing_mats:
-                        st.text(f"• {emat['title']} ({emat['created_at'].split('T')[0]})")
-            
-            # Subtab: Evaluate Student Submissions
-            with subtab_evaluate_submissions:
-                st.subheader("Ödev Değerlendirme & AI Analizleri")
-                
-                # Fetch submissions for this course
-                sub_res = requests.get(f"{API_URL}/courses/{selected_course['id']}/submissions")
-                submissions = sub_res.json() if sub_res.status_code == 200 else []
-                
-                if not submissions:
-                    st.info("Bu derse henüz ödev gönderimi yapılmamış.")
-                else:
-                    for i, sub in enumerate(submissions):
-                        # Fetch student username
-                        std_res = requests.get(f"{API_URL}/users/{sub['student_id']}")
-                        student_name = std_res.json()["username"] if std_res.status_code == 200 else f"Öğrenci #{sub['student_id']}"
-                        
-                        submitted_date = sub["submitted_at"].split("T")[0]
-                        
-                        with st.expander(f"👤 Öğrenci: {student_name} | Tarih: {submitted_date} | Not: {sub['grade']}"):
-                            st.markdown("**Öğrencinin Gönderdiği Metin:**")
-                            st.text_area("İçerik", sub["text_content"], height=150, disabled=True, key=f"t_sub_txt_{i}")
-                            
-                            st.divider()
-                            st.markdown("#### Yapay Zekâ Analiz Raporu")
-                            st.markdown(sub["ai_feedback"])
-                            
-                            # Option to re-trigger AI Analysis
-                            st.divider()
-                            st.markdown("##### ⚙️ Yapay Zekâyı Yeniden Çalıştır")
-                            if st.button("Yeniden Analiz Et", key=f"re_eval_{sub['id']}"):
-                                with st.spinner("Yapay zekâ analizi yenileniyor..."):
-                                    re_res = requests.post(
-                                        f"{API_URL}/submissions/{sub['id']}/reanalyze",
-                                        json={
-                                            "text_content": sub["text_content"],
-                                            "course_title": selected_course["title"],
-                                            "provider": st.session_state.api_provider,
-                                            "api_key": st.session_state.api_key
-                                        }
-                                    )
-                                    if re_res.status_code == 200:
+                                st.divider()
+                                st.markdown("#### Yapay Zekâ Analiz Raporu")
+                                st.markdown(sub.ai_feedback)
+                                
+                                st.divider()
+                                st.markdown("##### ⚙️ Yapay Zekâyı Yeniden Çalıştır")
+                                if st.button("Yeniden Analiz Et", key=f"re_eval_{sub.id}"):
+                                    with st.spinner("Yapay zekâ analizi yenileniyor..."):
+                                        analysis = ai_service.analyze_submission(
+                                            text_content=sub.text_content,
+                                            course_title=selected_course["title"],
+                                            provider=st.session_state.api_provider,
+                                            api_key=st.session_state.api_key
+                                        )
+                                        sub.ai_feedback = analysis.get("feedback")
+                                        sub.grade = analysis.get("grade")
+                                        db.commit()
                                         st.success("Yapay zekâ analizi başarıyla yenilendi!")
                                         st.rerun()
-                                    else:
-                                        st.error("Yeniden analiz yapılamadı.")
+        finally:
+            db.close()
                                         
     # 2. CREATE NEW COURSE
     with tab_create_course:
@@ -504,12 +493,12 @@ elif st.session_state.user["role"] == "teacher":
                 if not c_title:
                     st.error("Ders başlığı boş olamaz.")
                 else:
-                    course_post_res = requests.post(
-                        f"{API_URL}/courses?teacher_id={teacher_id}",
-                        json={"title": c_title, "description": c_desc}
-                    )
-                    if course_post_res.status_code == 201:
+                    db = get_session()
+                    try:
+                        new_course = models.Course(title=c_title, description=c_desc, teacher_id=teacher_id)
+                        db.add(new_course)
+                        db.commit()
                         st.success(f"'{c_title}' dersi başarıyla oluşturuldu!")
                         st.rerun()
-                    else:
-                        st.error("Ders oluşturulurken hata oluştu.")
+                    finally:
+                        db.close()
